@@ -1,0 +1,16 @@
+[07/15 16:17:17.261826][info][496583][MacUsbPal.cpp:213] Create PollingDeviceWatcher!
+[07/15 16:17:17.261844][info][496583][DeviceManager.cpp:25] Current found device(s): (0)
+[07/15 16:17:17.261846][info][496583][DeviceManager.cpp:405] Enable net device enumeration: true
+[07/15 16:17:19.248813][info][496583][DeviceManager.cpp:25] Current device(s) list: (0)
+[07/15 16:20:31.752011][info][500989][MacUsbPal.cpp:213] Create PollingDeviceWatcher!
+[07/15 16:20:31.752032][info][500989][DeviceManager.cpp:25] Current found device(s): (0)
+[07/15 16:20:31.752034][info][500989][DeviceManager.cpp:405] Enable net device enumeration: true
+[07/15 16:20:32.765262][info][500989][DeviceManager.cpp:25] Current device(s) list: (0)
+[07/15 16:22:10.672611][info][503617][MacUsbPal.cpp:213] Create PollingDeviceWatcher!
+[07/15 16:22:10.672631][info][503617][DeviceManager.cpp:25] Current found device(s): (0)
+[07/15 16:22:10.672633][info][503617][DeviceManager.cpp:405] Enable net device enumeration: true
+[07/15 16:22:11.690130][info][503617][DeviceManager.cpp:25] Current device(s) list: (0)
+[07/15 16:23:23.585033][info][505111][MacUsbPal.cpp:213] Create PollingDeviceWatcher!
+[07/15 16:23:23.585052][info][505111][DeviceManager.cpp:25] Current found device(s): (0)
+[07/15 16:23:23.585054][info][505111][DeviceManager.cpp:405] Enable net device enumeration: true
+[07/15 16:23:24.610287][info][505111][DeviceManager.cpp:25] Current device(s) list: (0)
