@@ -1,0 +1,215 @@
+# =============================================================================
+# release-candidate.yml - Release Candidate Testing
+# Trigger: workflow_dispatch (manual)
+# Goal: Full regression, multi-platform build, release package generation
+# =============================================================================
+name: Release Candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g., v2.1.0)"
+        required: true
+        type: string
+      ref:
+        description: "Branch or tag to build from"
+        required: false
+        default: ""
+        type: string
+      python_versions:
+        description: "Python versions to build (min/default/all)"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - min
+          - default
+          - all
+      platform:
+        description: "Platform to build (linux-x64/linux-arm64/macos/windows-x64/all)"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - linux-x64
+          - linux-arm64
+          - macos
+          - windows-x64
+
+env:
+  UV_LINK_MODE: copy
+
+jobs:
+  # ============================================================
+  # Job 0: Dynamically generate version matrix
+  # ============================================================
+  generate-matrix:
+    name: "Generate Build Matrix"
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix-include: ${{ steps.set-matrix.outputs.matrix-include }}
+    steps:
+      - name: Set version matrix
+        id: set-matrix
+        run: |
+          VERSION_MODE="${{ github.event.inputs.python_versions || 'all' }}"
+          PLATFORM="${{ github.event.inputs.platform || 'all' }}"
+          echo "Version mode: $VERSION_MODE"
+          echo "Platform: $PLATFORM"
+
+          case "$VERSION_MODE" in
+            min)
+              VERSIONS=("3.10")
+              ;;
+            default)
+              VERSIONS=("3.10" "3.11" "3.12")
+              ;;
+            all|*)
+              VERSIONS=("3.8" "3.9" "3.10" "3.11" "3.12" "3.13")
+              ;;
+          esac
+
+          MATRIX="["
+          FIRST=true
+
+          for pyver in "${VERSIONS[@]}"; do
+            if [[ "$PLATFORM" == "all" || "$PLATFORM" == "linux-x64" ]]; then
+              if [ "$FIRST" = true ]; then FIRST=false; else MATRIX+=","; fi
+              MATRIX+='{"os":"self-hosted","runner_labels":["self-hosted","X64","Linux","python-release"],"os_name":"linux-x64","python-version":"'$pyver'","arch":"x64","build_script":"bash scripts/build_whl/build-whl-uv.sh","label":"Linux-x64-Python-'$pyver'"}'
+            fi
+
+            if [[ "$PLATFORM" == "all" || "$PLATFORM" == "linux-arm64" ]]; then
+              if [ "$FIRST" = true ]; then FIRST=false; else MATRIX+=","; fi
+              MATRIX+='{"os":"self-hosted","runner_labels":["self-hosted","ARM64","Linux","python-release"],"os_name":"linux-arm64","python-version":"'$pyver'","arch":"arm64","build_script":"bash scripts/build_whl/build-whl-uv.sh","label":"Linux-arm64-Python-'$pyver'"}'
+            fi
+
+            if [[ "$PLATFORM" == "all" || "$PLATFORM" == "windows-x64" ]]; then
+              if [ "$FIRST" = true ]; then FIRST=false; else MATRIX+=","; fi
+              MATRIX+='{"os":"windows-2022","python-version":"'$pyver'","arch":"x64","build_script":"powershell -Command .\\scripts\\build_whl\\build-whl-uv.ps1","label":"Windows-x64-Python-'$pyver'"}'
+            fi
+
+            if [[ "$PLATFORM" == "all" || "$PLATFORM" == "macos" ]]; then
+              if [ "$FIRST" = true ]; then FIRST=false; else MATRIX+=","; fi
+              MATRIX+='{"os":"macos-latest","python-version":"'$pyver'","arch":"arm64","build_script":"bash scripts/build_whl/build-whl-uv-macos.sh","label":"macOS-arm64-Python-'$pyver'"}'
+            fi
+          done
+
+          MATRIX+="]"
+
+          echo "matrix-include=$MATRIX" >> $GITHUB_OUTPUT
+          echo "Matrix: $MATRIX"
+
+  # ============================================================
+  # Job 1: Multi-platform Wheel build
+  # ============================================================
+  build-wheels:
+    name: "Build Wheels - ${{ matrix.label }}"
+    runs-on: ${{ matrix.runner_labels || matrix.os }}
+    needs: generate-matrix
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.generate-matrix.outputs.matrix-include) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Build wheel (self-hosted Linux via docker)
+        if: matrix.runner_labels
+        run: |
+          docker run --rm --net=host \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            --entrypoint bash \
+            python-build-env:latest \
+            -c "bash scripts/build_whl/build-whl-uv.sh --yes ${{ matrix.python-version }} \
+            && chown -R $(id -u):$(id -g) /workspace"
+
+      - name: Install uv
+        if: "!matrix.runner_labels"
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux' && !matrix.runner_labels
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build build-essential \
+            libusb-1.0-0-dev libudev-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake libusb
+
+      - name: Build wheel
+        if: "!matrix.runner_labels"
+        run: |
+          ${{ matrix.build_script }} ${{ matrix.python-version }} --clean
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-wheels-${{ matrix.os_name || matrix.os }}-${{ matrix.arch }}-py${{ matrix.python-version }}
+          path: wheel/*.whl
+          retention-days: 30
+
+  # ============================================================
+  # Job 2: Create Release
+  # ============================================================
+  create-release:
+    name: "Create Release"
+    runs-on: ubuntu-22.04
+    needs: [generate-matrix, build-wheels]
+    if: success()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: release-wheels/
+          pattern: release-wheels-*
+
+      - name: Organize wheels
+        run: |
+          echo "Downloaded wheel artifacts:"
+          find release-wheels/ -name "*.whl" -type f
+          echo ""
+          echo "Wheel summary:"
+          for whl in $(find release-wheels/ -name "*.whl" -type f); do
+            echo "  $(basename "$whl")"
+          done
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd release-wheels/
+          for whl in $(find . -name "*.whl" -type f); do
+            sha256sum "$whl"
+          done > ../SHA256SUMS
+          cd ..
+          echo "Checksums generated:"
+          cat SHA256SUMS
+
+      - name: Verify checksums
+        run: |
+          cd release-wheels/
+          sha256sum -c ../SHA256SUMS
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: Release ${{ github.event.inputs.version }}
+          draft: true
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            release-wheels/**/*.whl
+            SHA256SUMS
