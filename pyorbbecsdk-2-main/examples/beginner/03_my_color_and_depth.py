@@ -93,6 +93,7 @@ YoloModel.to(YOLO_DEVICE)
 # マルチスレッド用の共有リソース
 # ---------------------------------------------------------------------------
 frame_queue = queue.Queue(maxsize=1)   # (color_image, depth_data) を1つだけ保持
+display_queue = queue.Queue(maxsize=1)
 stop_event = threading.Event()
 tcp_lock = threading.Lock()
 
@@ -178,7 +179,7 @@ def yolo_worker(use_tcp: bool):
             continue
 
         try:
-            results = YoloModel(color_image, imgsz=640, device=YOLO_DEVICE, verbose=False)
+            results = YoloModel(color_image, imgsz=640, device="mps", verbose=False)
             results = results[0]
         except Exception as e:
             print(f"YOLO推論エラー: {e}")
@@ -189,7 +190,7 @@ def yolo_worker(use_tcp: bool):
         kpts = results.keypoints.xy.cpu().numpy()
         if len(kpts) == 0:
             continue
-
+        # cv2.imshow("YOLO Keypoints", results.plot())
         left_eye = kpts[0][1]
         right_eye = kpts[0][2]
 
@@ -199,12 +200,23 @@ def yolo_worker(use_tcp: bool):
         h, w = depth_data.shape[:2]
         if not (0 <= ly < h and 0 <= lx < w and 0 <= ry < h and 0 <= rx < w):
             continue
-
+        # --- ここで描画フレームをdisplay_queueへ ---
+        annotated = results.plot()
+        if display_queue.full():
+            try:
+                display_queue.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            display_queue.put_nowait(annotated)
+        except queue.Full:
+            pass
         left_depth = depth_data[ly, lx]
         right_depth = depth_data[ry, rx]
 
         left_world = pixel_to_world(lx, ly, left_depth, fx, fy, cx, cy)
         right_world = pixel_to_world(rx, ry, right_depth, fx, fy, cx, cy)
+        print(f"Left Eye 3D: {left_world}, Right Eye 3D: {right_world}")
         if left_world is None or right_world is None:
             continue
 
@@ -213,8 +225,9 @@ def yolo_worker(use_tcp: bool):
             (left_world[1] + right_world[1]) / 2,
             (left_world[2] + right_world[2]) / 2,
         )
-        X, Y, Z = eye_center
-        message = f"{X:.3f},{Y:.3f},{Z:.3f}\n"
+        XL, YL, ZL = left_world
+        XR, YR, ZR = right_world
+        message = f"{XL:.3f},{YL:.3f},{ZL:.3f},{XR:.3f},{YR:.3f},{ZR:.3f}\n"
 
         if use_tcp and client is not None:
             try:
@@ -274,7 +287,7 @@ def main():
     else:
         print("TCPなしモードで起動します（送信は行いません）")
 
-    window_name = "Color + Depth Aligned  |  Q/ESC = quit"
+    window_name = "YoloKeypoints"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 1280, 720)
 
@@ -410,12 +423,20 @@ def main():
                     status = f"{mode_str} | {sync_str}"
 
                 cv2.putText(color_image, status, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
+                
                 # -- YOLO推論は毎フレームではなく間引いて推論スレッドへ渡す --
                 frame_count += 1
                 if frame_count % 2 == 0:
                     # copy() で推論スレッドとメインスレッドがデータを共有しないようにする
                     push_frame_for_inference(color_image.copy(), depth_data.copy())
+                
+                # -- YOLOランドマーク表示（推論スレッドから受け取り） --
+                try:
+                    annotated_frame = display_queue.get_nowait()
+                    cv2.imshow(window_name, annotated_frame)
+                except queue.Empty:
+                    pass
+
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), ESC_KEY):
