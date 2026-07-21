@@ -18,7 +18,7 @@
 #    python 03_color_and_depth_aligned_mt.py --hw
 #    python 03_color_and_depth_aligned_mt.py --no-tcp
 # ******************************************************************************
-
+import time
 import math
 import argparse
 import os
@@ -73,6 +73,8 @@ ESC_KEY = 27
 MIN_DEPTH = 20
 MAX_DEPTH = 10000
 
+
+
 # ---------------------------------------------------------------------------
 # デバイス選択（M1/M2 Mac の GPU = MPS を優先的に使用）
 # ---------------------------------------------------------------------------
@@ -104,6 +106,21 @@ _intrinsics = {"fx": None, "fy": None, "cx": None, "cy": None}
 # ---------------------------------------------------------------------------
 # ヘルパー関数
 # ---------------------------------------------------------------------------
+
+def push_frame_for_inference(color_image, depth_data, capture_ts):
+    """
+    推論スレッドへフレームを渡す。capture_ts（取得時刻）も一緒に載せる。
+    キューが満杯なら古いフレームを捨てて最新に差し替える。
+    """
+    if frame_queue.full():
+        try:
+            frame_queue.get_nowait()
+        except queue.Empty:
+            pass
+    try:
+        frame_queue.put_nowait((color_image, depth_data, capture_ts))
+    except queue.Full:
+        pass
 
 def euclidean_distance(p1, p2):
     """2つの3D座標(cm)間のユークリッド距離(cm)を計算"""
@@ -177,9 +194,8 @@ def yolo_worker(use_tcp: bool):
         if fx is None:
             # --hw モードなど、内部パラメータ未取得の場合は座標計算をスキップ
             continue
-
         try:
-            results = YoloModel(color_image, imgsz=640, device="mps", verbose=False)
+            results = YoloModel(color_image, imgsz=320, device=YOLO_DEVICE, verbose=False)
             results = results[0]
         except Exception as e:
             print(f"YOLO推論エラー: {e}")
@@ -201,22 +217,23 @@ def yolo_worker(use_tcp: bool):
         if not (0 <= ly < h and 0 <= lx < w and 0 <= ry < h and 0 <= rx < w):
             continue
         # --- ここで描画フレームをdisplay_queueへ ---
-        annotated = results.plot()
-        if display_queue.full():
+        if use_tcp==False:
+            annotated = results.plot()
+            if display_queue.full():
+                try:
+                    display_queue.get_nowait()
+                except queue.Empty:
+                    pass
             try:
-                display_queue.get_nowait()
-            except queue.Empty:
+                display_queue.put_nowait(annotated)
+            except queue.Full:
                 pass
-        try:
-            display_queue.put_nowait(annotated)
-        except queue.Full:
-            pass
         left_depth = depth_data[ly, lx]
         right_depth = depth_data[ry, rx]
 
         left_world = pixel_to_world(lx, ly, left_depth, fx, fy, cx, cy)
         right_world = pixel_to_world(rx, ry, right_depth, fx, fy, cx, cy)
-        print(f"Left Eye 3D: {left_world}, Right Eye 3D: {right_world}")
+        # print(f"Left Eye 3D: {left_world}, Right Eye 3D: {right_world}")
         if left_world is None or right_world is None:
             continue
 
@@ -235,30 +252,13 @@ def yolo_worker(use_tcp: bool):
                     client.sendall(message.encode())
             except OSError as e:
                 print(f"TCP送信エラー: {e}")
-
-
-def push_frame_for_inference(color_image, depth_data):
-    """
-    推論スレッドへフレームを渡す。キューが満杯（＝推論が追いついていない）場合は
-    古いフレームを捨てて最新のものに差し替える。これによりメインループは
-    絶対にブロックされない。
-    """
-    if frame_queue.full():
-        try:
-            frame_queue.get_nowait()
-        except queue.Empty:
-            pass
-    try:
-        frame_queue.put_nowait((color_image, depth_data))
-    except queue.Full:
-        pass
-
-
 # ---------------------------------------------------------------------------
 # メイン処理
 # ---------------------------------------------------------------------------
 
 def main():
+    #デバッグ用
+    last_report = 0.0
     frame_count = 0
     ctx = Context()
     device_list = ctx.query_devices()
@@ -276,6 +276,7 @@ def main():
     global client
     if use_tcp:
         client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         print("接続中...")
         try:
             client.connect((HOST, PORT))
@@ -406,14 +407,14 @@ def main():
                     depth_data = np.where((depth_data > MIN_DEPTH) & (depth_data < MAX_DEPTH), depth_data, 0)
 
                 # -- ステータス表示用（任意） --
-                depth_vis = cv2.normalize(depth_data, None, 0, 255, cv2.NORM_MINMAX)
-                depth_vis = cv2.applyColorMap(depth_vis.astype(np.uint8), cv2.COLORMAP_JET)
-                h, w = color_image.shape[:2]
-                if depth_vis.shape[:2] != (h, w):
-                    depth_vis = cv2.resize(depth_vis, (w, h), interpolation=cv2.INTER_NEAREST)
+                # depth_vis = cv2.normalize(depth_data, None, 0, 255, cv2.NORM_MINMAX)
+                # depth_vis = cv2.applyColorMap(depth_vis.astype(np.uint8), cv2.COLORMAP_JET)
+                # h, w = color_image.shape[:2]
+                # if depth_vis.shape[:2] != (h, w):
+                #     depth_vis = cv2.resize(depth_vis, (w, h), interpolation=cv2.INTER_NEAREST)
 
                 blend_alpha = alpha if args.hw else 0.5
-                overlay = cv2.addWeighted(color_image, 1 - blend_alpha, depth_vis, blend_alpha, 0)
+                # overlay = cv2.addWeighted(color_image, 1 - blend_alpha, depth_vis, blend_alpha, 0)
 
                 if args.hw:
                     status = f"HW D2C: {'ON' if enable_hw_d2c else 'OFF'}  alpha={blend_alpha:.1f}"
@@ -423,19 +424,17 @@ def main():
                     status = f"{mode_str} | {sync_str}"
 
                 cv2.putText(color_image, status, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
                 
                 # -- YOLO推論は毎フレームではなく間引いて推論スレッドへ渡す --
-                frame_count += 1
-                if frame_count % 2 == 0:
-                    # copy() で推論スレッドとメインスレッドがデータを共有しないようにする
-                    push_frame_for_inference(color_image.copy(), depth_data.copy())
-                
+                push_frame_for_inference(color_image.copy(), depth_data.copy())
                 # -- YOLOランドマーク表示（推論スレッドから受け取り） --
-                try:
-                    annotated_frame = display_queue.get_nowait()
-                    cv2.imshow(window_name, annotated_frame)
-                except queue.Empty:
-                    pass
+                if use_tcp==False:
+                    try:
+                        annotated_frame = display_queue.get_nowait()
+                        cv2.imshow(window_name, annotated_frame)
+                    except queue.Empty:
+                        pass
 
 
                 key = cv2.waitKey(1) & 0xFF
