@@ -1,31 +1,35 @@
 # ******************************************************************************
-#  pyorbbecsdk 初級サンプル 03 — カラーとデプスのアライメント（マルチスレッド版）
+#  pyorbbecsdk 初級サンプル 03 — カラーとデプスのアライメント（マルチスレッド版・最適化）
 #
-#  【マルチスレッド化のポイント】
-#    - メインスレッド : パイプラインからのフレーム取得・アライメント・デプス変換のみを担当
-#                        （ここは高頻度・低遅延で回したいのでYOLO推論を絶対に挟まない）
-#    - 推論スレッド    : YOLOによる姿勢推定 → 目の3D座標計算 → TCP送信 を担当
-#                        （YOLOは重いので、メインループをブロックしないよう別スレッドへ）
-#    - 受け渡し        : queue.Queue(maxsize=1) を使用。
-#                        推論が追いつかない場合は「古いフレームを捨てて最新だけ入れる」
-#                        方式にすることで、キューが詰まってメイン側が待たされることがない
-#                        （＝常に最新のフレームだけを処理する「フレームスキップ」構成）
+#  【最適化のポイント】
+#    - 深度処理を「2ピクセルだけ」に縮小：メインスレッドで毎フレーム行っていた
+#      1280x720全体の float32 変換・乗算・クリップを廃止。uint16 コピーだけ推論
+#      スレッドへ渡し、目の2ピクセルのみスケール適用・クリップする。
+#    - CoreML エクスポート対応（USE_COREML フラグ）：Mac では MPS より CoreML +
+#      Neural Engine が高速なことが多い。要ベンチマーク＆キーポイント検証。
+#    - ウォームアップ追加（初回推論のコンパイルコストを吸収）。
+#    - TCP モードでは GUI 描画（namedWindow / putText / waitKey）をスキップ。
+#    - --hw モードでも内部パラメータを取得するよう修正（座標計算が走るように）。
+#    - 重複していた push_frame_for_inference を統一。
+#    - 計測ログ追加：results.speed とメインループ各段階の時間を出力。
 #
 #  依存パッケージ: numpy, opencv-python, utils.py, ultralytics
 #
 #  実行方法:
-#    python 03_color_and_depth_aligned_mt.py
-#    python 03_color_and_depth_aligned_mt.py --hw
-#    python 03_color_and_depth_aligned_mt.py --no-tcp
+#    python 03_my_color_and_depth.py
+#    python 03_my_color_and_depth.py --hw
+#    python 03_my_color_and_depth.py --no-tcp
+#    python 03_my_color_and_depth.py --coreml   # CoreML(.mlpackage) を使用
 # ******************************************************************************
 import time
 import math
 import argparse
 import os
 import sys
-import time
 import threading
 import queue
+from collections import deque
+
 import torch
 from ultralytics import YOLO
 
@@ -33,7 +37,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import cv2
 import numpy as np
-import mediapipe as mp
 import socket
 from utils import frame_to_bgr_image
 
@@ -50,51 +53,57 @@ from pyorbbecsdk import (
     Pipeline,
 )
 
-# MediaPipe Face Mesh（現状未使用だが元コードを維持）
-mp_face_mesh = mp.solutions.face_mesh
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
+# --- 設定用の定数 ---
+ESC_KEY = 27
+MIN_DEPTH = 20
+MAX_DEPTH = 10000
 
-face_mesh = mp_face_mesh.FaceMesh(
-    static_image_mode=False,
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+# CoreML を使うかどうか。Mac では MPS より高速なことが多いが、
+# pose モデルの keypoints が正しく取れるか必ず検証すること（ベンチマーク必須）。
+USE_COREML = False
+
+# CoreML へのエクスポートが必要な場合は以下を一度だけ実行:
+#   YOLO("yolo11n-pose.pt").export(format="coreml", imgsz=320)
+# 生成された yolo11n-pose.mlpackage を USE_COREML=True で読み込む。
 
 HOST = "127.0.0.1"
 PORT = 50000
 
 client = None  # main() 内で必要な場合のみ接続する
 
-# --- 設定用の定数 ---
-ESC_KEY = 27
-MIN_DEPTH = 20
-MAX_DEPTH = 10000
-
-
 
 # ---------------------------------------------------------------------------
-# デバイス選択（M1/M2 Mac の GPU = MPS を優先的に使用）
+# デバイス選択
 # ---------------------------------------------------------------------------
-if torch.backends.mps.is_available():
-    YOLO_DEVICE = "mps"
-elif torch.cuda.is_available():
-    YOLO_DEVICE = "cuda"
+if USE_COREML:
+    # CoreML はデバイス指定不要（Neural Engine / CPU を内部で選択）
+    YOLO_DEVICE = ""          # device 引数には None を渡す
+    MODEL_PATH = "yolo11n-pose.mlpackage"
 else:
-    YOLO_DEVICE = "cpu"
-print(f"YOLO推論デバイス: {YOLO_DEVICE}")
+    if torch.backends.mps.is_available():
+        YOLO_DEVICE = "mps"
+    elif torch.cuda.is_available():
+        YOLO_DEVICE = "cuda"
+    else:
+        YOLO_DEVICE = "cpu"
+    MODEL_PATH = "yolo11n-pose.pt"
+print(f"YOLO推論デバイス: {YOLO_DEVICE or 'coreml'}, モデル: {MODEL_PATH}")
 
 # YOLOモデルの読み込み
-YoloModel = YOLO("yolo11n-pose.pt")
-# モデルを先にデバイスへ乗せておく（毎推論ごとの転送コストを避ける）
-YoloModel.to(YOLO_DEVICE)
+YoloModel = YOLO(MODEL_PATH)
+if YOLO_DEVICE:
+    YoloModel.to(YOLO_DEVICE)
+
+# ウォームアップ：初回推論のコンパイル/転送コストを事前に吸収
+_warmup_img = np.zeros((320, 320, 3), dtype=np.uint8)
+for _ in range(5):
+    YoloModel(_warmup_img, imgsz=320, device=YOLO_DEVICE or None, verbose=False)
+print("YOLO ウォームアップ完了")
 
 # ---------------------------------------------------------------------------
 # マルチスレッド用の共有リソース
 # ---------------------------------------------------------------------------
-frame_queue = queue.Queue(maxsize=1)   # (color_image, depth_data) を1つだけ保持
+frame_queue = queue.Queue(maxsize=1)   # (color_image, depth_raw, depth_scale) を1つだけ保持
 display_queue = queue.Queue(maxsize=1)
 stop_event = threading.Event()
 tcp_lock = threading.Lock()
@@ -102,15 +111,28 @@ tcp_lock = threading.Lock()
 # カメラ内部パラメータ（main() 内で設定してからスレッド開始する）
 _intrinsics = {"fx": None, "fy": None, "cx": None, "cy": None}
 
+# 計測用バッファ
+_main_timings = {
+    "align": deque(maxlen=120),
+    "color": deque(maxlen=120),
+    "depth_copy": deque(maxlen=120),
+    "push": deque(maxlen=120),
+    "total": deque(maxlen=120),
+}
+_worker_timings = {
+    "inference": deque(maxlen=120),
+    "postprocess": deque(maxlen=120),
+}
+
 
 # ---------------------------------------------------------------------------
 # ヘルパー関数
 # ---------------------------------------------------------------------------
 
-def push_frame_for_inference(color_image, depth_data, capture_ts):
+def push_frame_for_inference(color_image, depth_raw, depth_scale):
     """
-    推論スレッドへフレームを渡す。capture_ts（取得時刻）も一緒に載せる。
-    キューが満杯なら古いフレームを捨てて最新に差し替える。
+    推論スレッドへフレームを渡す。キューが満杯（＝推論が追いついていない）場合は
+    古いフレームを捨てて最新のものに差し替える。メインループは絶対にブロックされない。
     """
     if frame_queue.full():
         try:
@@ -118,9 +140,10 @@ def push_frame_for_inference(color_image, depth_data, capture_ts):
         except queue.Empty:
             pass
     try:
-        frame_queue.put_nowait((color_image, depth_data, capture_ts))
+        frame_queue.put_nowait((color_image, depth_raw, depth_scale))
     except queue.Full:
         pass
+
 
 def euclidean_distance(p1, p2):
     """2つの3D座標(cm)間のユークリッド距離(cm)を計算"""
@@ -131,9 +154,9 @@ def pixel_to_world(u, v, depth_mm, fx, fy, cx, cy):
     """
     u, v      : ピクセル座標（反転していない元画像上）
     depth_mm  : そのピクセルの深度値（mm）
-    戻り値    : (X, Y, Z) メートル単位
+    戻り値    : (X, Y, Z) cm 単位（depth_mm / 10.0 で mm→cm 変換）
     """
-    Z = depth_mm / 10.0  # mm → m
+    Z = depth_mm / 10.0  # mm → cm
     if Z <= 0:
         return None
     X = (u - cx) * Z / fx
@@ -155,6 +178,19 @@ def get_hw_stream_config(pipeline: Pipeline):
             config.enable_stream(hw_depth_list[0])
             config.enable_stream(color_profile)
             config.set_align_mode(OBAlignMode.HW_MODE)
+
+            # --hw モードでも内部パラメータを取得（座標計算を有効にする）
+            try:
+                intrinsic = color_profile.as_video_stream_profile().get_intrinsic()
+                _intrinsics["fx"] = intrinsic.fx
+                _intrinsics["fy"] = intrinsic.fy
+                _intrinsics["cx"] = intrinsic.cx
+                _intrinsics["cy"] = intrinsic.cy
+                print(f"[HW] fx={intrinsic.fx}, fy={intrinsic.fy}, "
+                      f"cx={intrinsic.cx}, cy={intrinsic.cy}")
+            except Exception as e:
+                print(f"[HW] 内部パラメータ取得失敗: {e}")
+
             return config
     except Exception as e:
         print(f"HW D2C config error: {e}")
@@ -169,6 +205,22 @@ def switch_hw_d2c(pipeline: Pipeline, config: Config, enable: bool):
     pipeline.start(config)
 
 
+def _log_timings():
+    """直近の計測結果の平均を表示（デバッグ用）"""
+    def avg(d):
+        return sum(d) / len(d) * 1000 if d else 0.0  # s → ms
+    print(
+        f"[TIMING ms] "
+        f"main(total={avg(_main_timings['total']):.1f} "
+        f"align={avg(_main_timings['align']):.1f} "
+        f"color={avg(_main_timings['color']):.1f} "
+        f"depth_copy={avg(_main_timings['depth_copy']):.1f} "
+        f"push={avg(_main_timings['push']):.1f}) "
+        f"worker(inference={avg(_worker_timings['inference']):.1f} "
+        f"postprocess={avg(_worker_timings['postprocess']):.1f})"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 推論スレッド本体（YOLO推論 + 座標計算 + TCP送信）
 # ---------------------------------------------------------------------------
@@ -176,14 +228,13 @@ def switch_hw_d2c(pipeline: Pipeline, config: Config, enable: bool):
 def yolo_worker(use_tcp: bool):
     """
     frame_queue から最新フレームを取り出し、YOLO推論・目の3D座標算出・TCP送信を行う。
-    キューが空なら短時間待って再チェックするだけなので、CPUを無駄に使わない。
-    メインループとは完全に非同期で動く。
     """
     global client
+    report_ts = time.perf_counter()
 
     while not stop_event.is_set():
         try:
-            color_image, depth_data = frame_queue.get(timeout=0.5)
+            color_image, depth_raw, depth_scale = frame_queue.get(timeout=0.5)
         except queue.Empty:
             continue
 
@@ -192,32 +243,52 @@ def yolo_worker(use_tcp: bool):
         cx = _intrinsics["cx"]
         cy = _intrinsics["cy"]
         if fx is None:
-            # --hw モードなど、内部パラメータ未取得の場合は座標計算をスキップ
             continue
+
+        t0 = time.perf_counter()
         try:
-            results = YoloModel(color_image, imgsz=320, device=YOLO_DEVICE, verbose=False)
+            results = YoloModel(color_image, imgsz=320,
+                                device=YOLO_DEVICE or None, verbose=False)
             results = results[0]
         except Exception as e:
             print(f"YOLO推論エラー: {e}")
             continue
 
+        t_inf = time.perf_counter()
+        _worker_timings["inference"].append(t_inf - t0)
+
         if results.keypoints is None:
             continue
-        kpts = results.keypoints.xy.cpu().numpy()
+        kpts = results.keypoints.xy
+        # CoreML/MPS では既に CPU 上のことが多いが、念のため .cpu() を挟む
+        kpts = kpts.cpu().numpy() if hasattr(kpts, "cpu") else np.asarray(kpts)
         if len(kpts) == 0:
             continue
-        # cv2.imshow("YOLO Keypoints", results.plot())
+
         left_eye = kpts[0][1]
         right_eye = kpts[0][2]
 
         lx, ly = int(left_eye[0]), int(left_eye[1])
         rx, ry = int(right_eye[0]), int(right_eye[1])
 
-        h, w = depth_data.shape[:2]
+        h, w = depth_raw.shape[:2]
         if not (0 <= ly < h and 0 <= lx < w and 0 <= ry < h and 0 <= rx < w):
             continue
-        # --- ここで描画フレームをdisplay_queueへ ---
-        if use_tcp==False:
+
+        # 深度は「目の2ピクセルだけ」取得・スケール適用・クリップ
+        left_depth = float(depth_raw[ly, lx]) * depth_scale
+        right_depth = float(depth_raw[ry, rx]) * depth_scale
+        if not (MIN_DEPTH < left_depth < MAX_DEPTH
+                and MIN_DEPTH < right_depth < MAX_DEPTH):
+            continue
+
+        left_world = pixel_to_world(lx, ly, left_depth, fx, fy, cx, cy)
+        right_world = pixel_to_world(rx, ry, right_depth, fx, fy, cx, cy)
+        if left_world is None or right_world is None:
+            continue
+
+        # 描画フレーム（TCP でなければ表示用に生成）
+        if use_tcp is False:
             annotated = results.plot()
             if display_queue.full():
                 try:
@@ -228,38 +299,32 @@ def yolo_worker(use_tcp: bool):
                 display_queue.put_nowait(annotated)
             except queue.Full:
                 pass
-        left_depth = depth_data[ly, lx]
-        right_depth = depth_data[ry, rx]
 
-        left_world = pixel_to_world(lx, ly, left_depth, fx, fy, cx, cy)
-        right_world = pixel_to_world(rx, ry, right_depth, fx, fy, cx, cy)
-        # print(f"Left Eye 3D: {left_world}, Right Eye 3D: {right_world}")
-        if left_world is None or right_world is None:
-            continue
-
-        eye_center = (
-            (left_world[0] + right_world[0]) / 2,
-            (left_world[1] + right_world[1]) / 2,
-            (left_world[2] + right_world[2]) / 2,
-        )
         XL, YL, ZL = left_world
         XR, YR, ZR = right_world
         message = f"{XL:.3f},{YL:.3f},{ZL:.3f},{XR:.3f},{YR:.3f},{ZR:.3f}\n"
-
+        print(message)
         if use_tcp and client is not None:
             try:
                 with tcp_lock:
                     client.sendall(message.encode())
             except OSError as e:
                 print(f"TCP送信エラー: {e}")
+
+        _worker_timings["postprocess"].append(time.perf_counter() - t_inf)
+
+        # 2秒おきにタイミングログ
+        now = time.perf_counter()
+        if now - report_ts > 2.0:
+            _log_timings()
+            report_ts = now
+
+
 # ---------------------------------------------------------------------------
 # メイン処理
 # ---------------------------------------------------------------------------
 
 def main():
-    #デバッグ用
-    last_report = 0.0
-    frame_count = 0
     ctx = Context()
     device_list = ctx.query_devices()
     if device_list.get_count() == 0:
@@ -269,9 +334,11 @@ def main():
     parser = argparse.ArgumentParser(description="Color + Depth aligned viewer (multithreaded)")
     parser.add_argument("--hw", action="store_true", help="Use hardware D2C alignment")
     parser.add_argument("--no-tcp", action="store_true", help="Do not connect to the TCP server")
+    parser.add_argument("--coreml", action="store_true", help="Force CoreML model (overrides USE_COREML)")
     args = parser.parse_args()
 
     use_tcp = not args.no_tcp
+    show_window = not use_tcp  # TCP 送信のみなら GUI をスキップして高速化
 
     global client
     if use_tcp:
@@ -289,8 +356,9 @@ def main():
         print("TCPなしモードで起動します（送信は行いません）")
 
     window_name = "YoloKeypoints"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, 1280, 720)
+    if show_window:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 1280, 720)
 
     pipeline = Pipeline()
     config = None
@@ -347,10 +415,11 @@ def main():
 
         align_filter = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
 
-        print("\nControls:")
-        print("  T       — Toggle align direction  (D2C ↔ C2D)")
-        print("  F       — Toggle frame sync        (ON / OFF)")
-        print("  Q / ESC — Quit\n")
+        if show_window:
+            print("\nControls:")
+            print("  T       — Toggle align direction  (D2C ↔ C2D)")
+            print("  F       — Toggle frame sync        (ON / OFF)")
+            print("  Q / ESC — Quit\n")
 
     try:
         pipeline.start(config)
@@ -364,11 +433,14 @@ def main():
     inference_thread = threading.Thread(target=yolo_worker, args=(use_tcp,), daemon=True)
     inference_thread.start()
 
+    report_ts = time.perf_counter()
+
     # ------------------------------------------------------------------
     # フレーム取得ループ（メインスレッド：ここは軽い処理のみ）
     # ------------------------------------------------------------------
     try:
         while True:
+            t_loop = time.perf_counter()
             try:
                 frames = pipeline.wait_for_frames(1000)
                 if not frames:
@@ -380,7 +452,9 @@ def main():
                     continue
 
                 if not args.hw:
+                    t_align = time.perf_counter()
                     frames = align_filter.process(frames)
+                    _main_timings["align"].append(time.perf_counter() - t_align)
                     if not frames:
                         continue
                     color_frame = frames.get_color_frame()
@@ -388,85 +462,87 @@ def main():
                     if not color_frame or not depth_frame:
                         continue
 
+                t_color = time.perf_counter()
                 color_image = frame_to_bgr_image(color_frame)
+                _main_timings["color"].append(time.perf_counter() - t_color)
                 if color_image is None:
                     continue
 
+                # 深度：uint16 コピーだけ取得（スケール適用・クリップは推論スレッドで2ピクセルのみ）
+                t_depth = time.perf_counter()
                 try:
-                    depth_data = np.frombuffer(depth_frame.get_data(), dtype=np.uint16).reshape(
-                        (depth_frame.get_height(), depth_frame.get_width())
-                    )
+                    depth_raw = np.frombuffer(depth_frame.get_data(), dtype=np.uint16).reshape(
+                        depth_frame.get_height(), depth_frame.get_width()
+                    ).copy()  # 内部バッファ再利用対策で必ず copy
                 except ValueError:
                     continue
+                depth_scale = depth_frame.get_depth_scale()
+                _main_timings["depth_copy"].append(time.perf_counter() - t_depth)
 
-                depth_data = depth_data.astype(np.float32) * depth_frame.get_depth_scale()
+                # ステータス描画は表示時のみ
+                if show_window:
+                    if args.hw:
+                        status = f"HW D2C: {'ON' if enable_hw_d2c else 'OFF'}  alpha={alpha:.1f}"
+                    else:
+                        mode_str = "D2C (Depth To Color)" if align_mode == 0 else "C2D (Color To Depth)"
+                        sync_str = "Sync: ON" if enable_sync else "Sync: OFF"
+                        status = f"{mode_str} | {sync_str}"
+                    cv2.putText(color_image, status, (20, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-                if args.hw:
-                    depth_data = np.clip(depth_data, MIN_DEPTH, MAX_DEPTH)
-                else:
-                    depth_data = np.where((depth_data > MIN_DEPTH) & (depth_data < MAX_DEPTH), depth_data, 0)
+                # 推論スレッドへ最新フレームを渡す
+                t_push = time.perf_counter()
+                push_frame_for_inference(color_image, depth_raw, depth_scale)
+                _main_timings["push"].append(time.perf_counter() - t_push)
 
-                # -- ステータス表示用（任意） --
-                # depth_vis = cv2.normalize(depth_data, None, 0, 255, cv2.NORM_MINMAX)
-                # depth_vis = cv2.applyColorMap(depth_vis.astype(np.uint8), cv2.COLORMAP_JET)
-                # h, w = color_image.shape[:2]
-                # if depth_vis.shape[:2] != (h, w):
-                #     depth_vis = cv2.resize(depth_vis, (w, h), interpolation=cv2.INTER_NEAREST)
-
-                blend_alpha = alpha if args.hw else 0.5
-                # overlay = cv2.addWeighted(color_image, 1 - blend_alpha, depth_vis, blend_alpha, 0)
-
-                if args.hw:
-                    status = f"HW D2C: {'ON' if enable_hw_d2c else 'OFF'}  alpha={blend_alpha:.1f}"
-                else:
-                    mode_str = "D2C (Depth To Color)" if align_mode == 0 else "C2D (Color To Depth)"
-                    sync_str = "Sync: ON" if enable_sync else "Sync: OFF"
-                    status = f"{mode_str} | {sync_str}"
-
-                cv2.putText(color_image, status, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-                
-                # -- YOLO推論は毎フレームではなく間引いて推論スレッドへ渡す --
-                push_frame_for_inference(color_image.copy(), depth_data.copy())
-                # -- YOLOランドマーク表示（推論スレッドから受け取り） --
-                if use_tcp==False:
+                # YOLOランドマーク表示（推論スレッドから受け取り）
+                if show_window:
                     try:
                         annotated_frame = display_queue.get_nowait()
                         cv2.imshow(window_name, annotated_frame)
                     except queue.Empty:
                         pass
 
+                _main_timings["total"].append(time.perf_counter() - t_loop)
 
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord("q"), ESC_KEY):
-                    break
-                if args.hw:
-                    if key in (ord("t"), ord("T")):
-                        enable_hw_d2c = not enable_hw_d2c
-                        switch_hw_d2c(pipeline, config, enable_hw_d2c)
-                    elif key in (ord("+"), ord("=")):
-                        alpha = min(1.0, alpha + alpha_step)
-                        print(f"Alpha: {alpha:.2f}")
-                    elif key in (ord("-"), ord("_")):
-                        alpha = max(0.0, alpha - alpha_step)
-                        print(f"Alpha: {alpha:.2f}")
-                else:
-                    if key in (ord("t"), ord("T")):
-                        align_mode = (align_mode + 1) % 2
-                        if align_mode == 0:
-                            align_filter = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
-                            print("Mode: Depth To Color")
-                        else:
-                            align_filter = AlignFilter(align_to_stream=OBStreamType.DEPTH_STREAM)
-                            print("Mode: Color To Depth")
-                    elif key in (ord("f"), ord("F")):
-                        enable_sync = not enable_sync
-                        if enable_sync:
-                            pipeline.enable_frame_sync()
-                            print("Frame sync: ON")
-                        else:
-                            pipeline.disable_frame_sync()
-                            print("Frame sync: OFF")
+                # 2秒おきにタイミングログ
+                now = time.perf_counter()
+                if now - report_ts > 2.0:
+                    _log_timings()
+                    report_ts = now
+
+                # GUI ポーリング（表示時のみ。TCP モードでは SIGINT で終了）
+                if show_window:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (ord("q"), ESC_KEY):
+                        break
+                    if args.hw:
+                        if key in (ord("t"), ord("T")):
+                            enable_hw_d2c = not enable_hw_d2c
+                            switch_hw_d2c(pipeline, config, enable_hw_d2c)
+                        elif key in (ord("+"), ord("=")):
+                            alpha = min(1.0, alpha + alpha_step)
+                            print(f"Alpha: {alpha:.2f}")
+                        elif key in (ord("-"), ord("_")):
+                            alpha = max(0.0, alpha - alpha_step)
+                            print(f"Alpha: {alpha:.2f}")
+                    else:
+                        if key in (ord("t"), ord("T")):
+                            align_mode = (align_mode + 1) % 2
+                            if align_mode == 0:
+                                align_filter = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
+                                print("Mode: Depth To Color")
+                            else:
+                                align_filter = AlignFilter(align_to_stream=OBStreamType.DEPTH_STREAM)
+                                print("Mode: Color To Depth")
+                        elif key in (ord("f"), ord("F")):
+                            enable_sync = not enable_sync
+                            if enable_sync:
+                                pipeline.enable_frame_sync()
+                                print("Frame sync: ON")
+                            else:
+                                pipeline.disable_frame_sync()
+                                print("Frame sync: OFF")
 
             except KeyboardInterrupt:
                 break
@@ -474,9 +550,7 @@ def main():
                 print(f"Runtime error: {e}")
                 continue
     finally:
-        # ------------------------------------------------------------------
         # 終了処理：推論スレッドを止めてからパイプライン・ウィンドウを閉じる
-        # ------------------------------------------------------------------
         stop_event.set()
         inference_thread.join(timeout=2.0)
         cv2.destroyAllWindows()
