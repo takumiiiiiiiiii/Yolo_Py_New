@@ -21,6 +21,8 @@
 #    python 03_my_color_and_depth.py --no-tcp
 #    python 03_my_color_and_depth.py --coreml   # CoreML(.mlpackage) を使用
 # ******************************************************************************
+
+
 import time
 import math
 import argparse
@@ -37,6 +39,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import cv2
 import numpy as np
+import open3d as o3d
+
 import socket
 from utils import frame_to_bgr_image
 
@@ -69,7 +73,36 @@ USE_COREML = False
 HOST = "127.0.0.1"
 PORT = 50000
 
+
 client = None  # main() 内で必要な場合のみ接続する
+
+
+HEAD_TOP_TO_EYE_DROP_CM = 12.0   # 頭頂から目までの推定オフセット(決め打ち)
+HALF_IPD_CM = 3.2                # 目の左右間隔の半分(決め打ち)
+
+//
+def estimate_head_top_pixel(nose, l_ear, r_ear, box_top_y):
+    xs = [p[0] for p in (nose, l_ear, r_ear) if p is not None]
+    cx_head = sum(xs) / len(xs) if xs else nose[0]
+    return cx_head, box_top_y  # (u, v)
+
+
+def estimate_yaw_ratio(nose, l_ear, r_ear):
+    if l_ear is None or r_ear is None:
+        return 0.0
+    span = r_ear[0] - l_ear[0]
+    if abs(span) < 1e-3:
+        return 0.0
+    mid = (l_ear[0] + r_ear[0]) / 2.0
+    return (nose[0] - mid) / span
+
+
+def fixed_eye_world_positions(head_world, yaw_ratio):
+    Xh, Yh, Zh = head_world
+    shift = yaw_ratio * HALF_IPD_CM
+    left = (Xh - HALF_IPD_CM, Yh + HEAD_TOP_TO_EYE_DROP_CM, Zh + shift)
+    right = (Xh + HALF_IPD_CM, Yh + HEAD_TOP_TO_EYE_DROP_CM, Zh - shift)
+    return left, right
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +219,8 @@ def get_hw_stream_config(pipeline: Pipeline):
                 _intrinsics["fy"] = intrinsic.fy
                 _intrinsics["cx"] = intrinsic.cx
                 _intrinsics["cy"] = intrinsic.cy
-                print(f"[HW] fx={intrinsic.fx}, fy={intrinsic.fy}, "
-                      f"cx={intrinsic.cx}, cy={intrinsic.cy}")
+                # print(f"[HW] fx={intrinsic.fx}, fy={intrinsic.fy}, "
+                #       f"cx={intrinsic.cx}, cy={intrinsic.cy}")
             except Exception as e:
                 print(f"[HW] 内部パラメータ取得失敗: {e}")
 
@@ -264,7 +297,9 @@ def yolo_worker(use_tcp: bool):
         kpts = kpts.cpu().numpy() if hasattr(kpts, "cpu") else np.asarray(kpts)
         if len(kpts) == 0:
             continue
-
+        nose = kpts[0][0]
+        l_ear = kpts[0][3]
+        r_ear = kpts[0][4]
         left_eye = kpts[0][1]
         right_eye = kpts[0][2]
 
@@ -303,7 +338,7 @@ def yolo_worker(use_tcp: bool):
         XL, YL, ZL = left_world
         XR, YR, ZR = right_world
         message = f"{XL:.3f},{YL:.3f},{ZL:.3f},{XR:.3f},{YR:.3f},{ZR:.3f}\n"
-        print(message)
+        # print(message)
         if use_tcp and client is not None:
             try:
                 with tcp_lock:
