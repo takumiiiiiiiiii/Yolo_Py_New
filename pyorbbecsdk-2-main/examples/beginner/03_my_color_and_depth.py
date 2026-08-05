@@ -80,7 +80,6 @@ client = None  # main() 内で必要な場合のみ接続する
 HEAD_TOP_TO_EYE_DROP_CM = 12.0   # 頭頂から目までの推定オフセット(決め打ち)
 HALF_IPD_CM = 3.2                # 目の左右間隔の半分(決め打ち)
 
-//
 def estimate_head_top_pixel(nose, l_ear, r_ear, box_top_y):
     xs = [p[0] for p in (nose, l_ear, r_ear) if p is not None]
     cx_head = sum(xs) / len(xs) if xs else nose[0]
@@ -243,14 +242,14 @@ def _log_timings():
     def avg(d):
         return sum(d) / len(d) * 1000 if d else 0.0  # s → ms
     print(
-        f"[TIMING ms] "
-        f"main(total={avg(_main_timings['total']):.1f} "
-        f"align={avg(_main_timings['align']):.1f} "
-        f"color={avg(_main_timings['color']):.1f} "
-        f"depth_copy={avg(_main_timings['depth_copy']):.1f} "
-        f"push={avg(_main_timings['push']):.1f}) "
-        f"worker(inference={avg(_worker_timings['inference']):.1f} "
-        f"postprocess={avg(_worker_timings['postprocess']):.1f})"
+        # f"[TIMING ms] "
+        # f"main(total={avg(_main_timings['total']):.1f} "
+        # f"align={avg(_main_timings['align']):.1f} "
+        # f"color={avg(_main_timings['color']):.1f} "
+        # f"depth_copy={avg(_main_timings['depth_copy']):.1f} "
+        # f"push={avg(_main_timings['push']):.1f}) "
+        # f"worker(inference={avg(_worker_timings['inference']):.1f} "
+        # f"postprocess={avg(_worker_timings['postprocess']):.1f})"
     )
 
 
@@ -295,33 +294,31 @@ def yolo_worker(use_tcp: bool):
         kpts = results.keypoints.xy
         # CoreML/MPS では既に CPU 上のことが多いが、念のため .cpu() を挟む
         kpts = kpts.cpu().numpy() if hasattr(kpts, "cpu") else np.asarray(kpts)
-        if len(kpts) == 0:
+        boxes = results.boxes.xyxy.cpu().numpy() if hasattr(results.boxes.xyxy, "cpu") else np.asarray(results.boxes.xyxy)
+        if len(kpts) == 0 or len(boxes) == 0:
             continue
         nose = kpts[0][0]
         l_ear = kpts[0][3]
         r_ear = kpts[0][4]
-        left_eye = kpts[0][1]
-        right_eye = kpts[0][2]
-
-        lx, ly = int(left_eye[0]), int(left_eye[1])
-        rx, ry = int(right_eye[0]), int(right_eye[1])
+        box_top_y = boxes[0][1]
+        hu,hv = estimate_head_top_pixel(nose,l_ear,r_ear,box_top_y)
+        hu,hv = int(hu),int(hv)
 
         h, w = depth_raw.shape[:2]
-        if not (0 <= ly < h and 0 <= lx < w and 0 <= ry < h and 0 <= rx < w):
+        if not (0 <= hv < h and 0 <= hu < w):
             continue
 
-        # 深度は「目の2ピクセルだけ」取得・スケール適用・クリップ
-        left_depth = float(depth_raw[ly, lx]) * depth_scale
-        right_depth = float(depth_raw[ry, rx]) * depth_scale
-        if not (MIN_DEPTH < left_depth < MAX_DEPTH
-                and MIN_DEPTH < right_depth < MAX_DEPTH):
+        head_depth = float(depth_raw[hv, hu]) * depth_scale
+        if not (MIN_DEPTH < head_depth < MAX_DEPTH):
             continue
 
-        left_world = pixel_to_world(lx, ly, left_depth, fx, fy, cx, cy)
-        right_world = pixel_to_world(rx, ry, right_depth, fx, fy, cx, cy)
-        if left_world is None or right_world is None:
+        head_world = pixel_to_world(hu, hv, head_depth, fx, fy, cx, cy)
+        if head_world is None:
             continue
+        yaw_ratio = estimate_yaw_ratio(nose, l_ear, r_ear)
+        left_world, right_world = fixed_eye_world_positions(head_world, yaw_ratio)
 
+       
         # 描画フレーム（TCP でなければ表示用に生成）
         if use_tcp is False:
             annotated = results.plot()
@@ -334,7 +331,6 @@ def yolo_worker(use_tcp: bool):
                 display_queue.put_nowait(annotated)
             except queue.Full:
                 pass
-
         XL, YL, ZL = left_world
         XR, YR, ZR = right_world
         message = f"{XL:.3f},{YL:.3f},{ZL:.3f},{XR:.3f},{YR:.3f},{ZR:.3f}\n"
