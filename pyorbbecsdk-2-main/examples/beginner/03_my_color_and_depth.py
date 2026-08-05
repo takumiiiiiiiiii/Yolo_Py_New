@@ -1,25 +1,15 @@
 # ******************************************************************************
-#  pyorbbecsdk 初級サンプル 03 — カラーとデプスのアライメント（マルチスレッド版・最適化）
+#  pyorbbecsdk 初級サンプル 03 — カラーとデプスのアライメント（マルチスレッド版・深度のみ）
 #
-#  【最適化のポイント】
-#    - 深度処理を「2ピクセルだけ」に縮小：メインスレッドで毎フレーム行っていた
-#      1280x720全体の float32 変換・乗算・クリップを廃止。uint16 コピーだけ推論
-#      スレッドへ渡し、目の2ピクセルのみスケール適用・クリップする。
-#    - CoreML エクスポート対応（USE_COREML フラグ）：Mac では MPS より CoreML +
-#      Neural Engine が高速なことが多い。要ベンチマーク＆キーポイント検証。
-#    - ウォームアップ追加（初回推論のコンパイルコストを吸収）。
-#    - TCP モードでは GUI 描画（namedWindow / putText / waitKey）をスキップ。
-#    - --hw モードでも内部パラメータを取得するよう修正（座標計算が走るように）。
-#    - 重複していた push_frame_for_inference を統一。
-#    - 計測ログ追加：results.speed とメインループ各段階の時間を出力。
+#  YOLO(ultralytics)関連の処理をすべて削除し、深度画像だけで頭頂点を推定する
+#  estimate_head_vertex_NoYolo / Un_yolo_worker 経路のみを残した版。
 #
-#  依存パッケージ: numpy, opencv-python, utils.py, ultralytics
+#  依存パッケージ: numpy, opencv-python, utils.py
 #
 #  実行方法:
-#    python 03_my_color_and_depth.py
-#    python 03_my_color_and_depth.py --hw
-#    python 03_my_color_and_depth.py --no-tcp
-#    python 03_my_color_and_depth.py --coreml   # CoreML(.mlpackage) を使用
+#    python 03_my_color_and_depth_noyolo.py
+#    python 03_my_color_and_depth_noyolo.py --hw
+#    python 03_my_color_and_depth_noyolo.py --no-tcp
 # ******************************************************************************
 
 
@@ -30,10 +20,7 @@ import os
 import sys
 import threading
 import queue
-from collections import deque
-
-import torch
-from ultralytics import YOLO
+from collections import deque, namedtuple
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -59,101 +46,24 @@ from pyorbbecsdk import (
 
 # --- 設定用の定数 ---
 ESC_KEY = 27
-MIN_DEPTH = 20
-MAX_DEPTH = 10000
-
-# CoreML を使うかどうか。Mac では MPS より高速なことが多いが、
-# pose モデルの keypoints が正しく取れるか必ず検証すること（ベンチマーク必須）。
-USE_COREML = False
-
-# CoreML へのエクスポートが必要な場合は以下を一度だけ実行:
-#   YOLO("yolo11n-pose.pt").export(format="coreml", imgsz=320)
-# 生成された yolo11n-pose.mlpackage を USE_COREML=True で読み込む。
 
 HOST = "127.0.0.1"
 PORT = 50000
 
-#頭部マスキング閾値
-HEAD_REGION_RATIO = 0.35
-DEPTH_TOLERANCE_MM = 250.0 
+# Yoloなしの場合の深度閾値(頭部として扱う距離レンジ, mm)
+MAX_DEPTH_NOYOLO = 1500
+MIN_DEPTH_NOYOLO = 400
 
 client = None  # main() 内で必要な場合のみ接続する
-
 
 HEAD_TOP_TO_EYE_DROP_CM = 12.0   # 頭頂から目までの推定オフセット(決め打ち)
 HALF_IPD_CM = 3.2                # 目の左右間隔の半分(決め打ち)
 
 
-def estimate_head_top_pixel(nose, l_ear, r_ear, box_top_y):
-    xs = [p[0] for p in (nose, l_ear, r_ear) if p is not None]
-    cx_head = sum(xs) / len(xs) if xs else nose[0]
-    return cx_head, box_top_y  # (u, v)
-
-
-def estimate_yaw_ratio(nose, l_ear, r_ear):
-    if l_ear is None or r_ear is None:
-        return 0.0
-    span = r_ear[0] - l_ear[0]
-    if abs(span) < 1e-3:
-        return 0.0
-    mid = (l_ear[0] + r_ear[0]) / 2.0
-    return (nose[0] - mid) / span
-
-
-def fixed_eye_world_positions(head_world, yaw_ratio):
-    Xh, Yh, Zh = head_world
-    shift = yaw_ratio * HALF_IPD_CM
-    left = (Xh - HALF_IPD_CM, Yh + HEAD_TOP_TO_EYE_DROP_CM, Zh + shift)
-    right = (Xh + HALF_IPD_CM, Yh + HEAD_TOP_TO_EYE_DROP_CM, Zh - shift)
-    return left, right
-
-from collections import namedtuple
-
 HeadVertexResult = namedtuple(
     "HeadVertexResult", ["world", "uv", "box_region"]
 )
 
-#深度から頭の位置を推定する関数
-def estimate_head_vertex(depth_raw, depth_scale, box, nose_uv, fx, fy, cx, cy):
-    h, w = depth_raw.shape[:2]
-    x1 = max(int(box[0]), 0)
-    y1 = max(int(box[1]), 0)
-    x2 = min(int(box[2]), w - 1)
-    y2 = min(int(box[3]), h - 1)
-    if x2 <= x1 or y2 <= y1:
-        return None
-
-    head_bottom = y1 + max(int((y2 - y1) * HEAD_REGION_RATIO), 1)
-
-    nx, ny = int(nose_uv[0]), int(nose_uv[1])
-    if not (0 <= ny < h and 0 <= nx < w):
-        return None
-    ref_depth = float(depth_raw[ny, nx]) * depth_scale
-    if not (MIN_DEPTH < ref_depth < MAX_DEPTH):
-        return None
-
-    region = depth_raw[y1:head_bottom, x1:x2].astype(np.float32) * depth_scale
-    valid = (
-        (region > MIN_DEPTH) & (region < MAX_DEPTH) &
-        (np.abs(region - ref_depth) < DEPTH_TOLERANCE_MM)
-    )
-
-    ys, xs = np.nonzero(valid)
-    if len(ys) == 0:
-        return None
-
-    top_row = ys.min()
-    row_xs = xs[ys == top_row]
-    top_col = int(np.mean(row_xs))
-    u = x1 + top_col
-    v = y1 + top_row
-    depth_mm = float(region[top_row, row_xs[0]])
-
-    world = pixel_to_world(u, v, depth_mm, fx, fy, cx, cy)
-    if world is None:
-        return None
-
-    return HeadVertexResult(world=world, uv=(u, v), box_region=(x1, y1, x2, head_bottom))
 
 def fixed_eye_world_positions_no_yaw(head_world):
     """向きを無視して、頭頂点からの定数オフセットだけで目の位置を出す"""
@@ -161,40 +71,61 @@ def fixed_eye_world_positions_no_yaw(head_world):
     left = (Xh - HALF_IPD_CM, Yh + HEAD_TOP_TO_EYE_DROP_CM, Zh)
     right = (Xh + HALF_IPD_CM, Yh + HEAD_TOP_TO_EYE_DROP_CM, Zh)
     return left, right
-#3D座標をピクセル座標に変換する関数
+
+
 def world_to_pixel(X, Y, Z, fx, fy, cx, cy):
+    """3D座標をピクセル座標に変換する関数"""
     if Z <= 0:
         return None
     u = fx * X / Z + cx
     v = fy * Y / Z + cy
     return int(u), int(v)
-# ---------------------------------------------------------------------------
-# デバイス選択
-# ---------------------------------------------------------------------------
-if USE_COREML:
-    # CoreML はデバイス指定不要（Neural Engine / CPU を内部で選択）
-    YOLO_DEVICE = ""          # device 引数には None を渡す
-    MODEL_PATH = "yolo11n-pose.mlpackage"
-else:
-    if torch.backends.mps.is_available():
-        YOLO_DEVICE = "mps"
-    elif torch.cuda.is_available():
-        YOLO_DEVICE = "cuda"
-    else:
-        YOLO_DEVICE = "cpu"
-    MODEL_PATH = "yolo11n-pose.pt"
-print(f"YOLO推論デバイス: {YOLO_DEVICE or 'coreml'}, モデル: {MODEL_PATH}")
 
-# YOLOモデルの読み込み
-YoloModel = YOLO(MODEL_PATH)
-if YOLO_DEVICE:
-    YoloModel.to(YOLO_DEVICE)
 
-# ウォームアップ：初回推論のコンパイル/転送コストを事前に吸収
-_warmup_img = np.zeros((320, 320, 3), dtype=np.uint8)
-for _ in range(5):
-    YoloModel(_warmup_img, imgsz=320, device=YOLO_DEVICE or None, verbose=False)
-print("YOLO ウォームアップ完了")
+def pixel_to_world(u, v, depth_mm, fx, fy, cx, cy):
+    """
+    u, v      : ピクセル座標（反転していない元画像上）
+    depth_mm  : そのピクセルの深度値（mm）
+    戻り値    : (X, Y, Z) cm 単位（depth_mm / 10.0 で mm→cm 変換）
+    """
+    Z = depth_mm / 10.0  # mm → cm
+    if Z <= 0:
+        return None
+    X = (u - cx) * Z / fx
+    Y = (v - cy) * Z / fy
+    return X, Y, Z
+
+
+def estimate_head_vertex_NoYolo(depth_raw, depth_scale, fx, fy, cx, cy):
+    """深度画像だけから頭の位置を推定する関数(YOLO不使用、NumPyベクトル化版)"""
+    region = depth_raw.astype(np.float32) * depth_scale
+
+    # 有効範囲(MIN_DEPTH_NOYOLO 〜 MAX_DEPTH_NOYOLO)内のピクセルを一括判定
+    valid = (region > MIN_DEPTH_NOYOLO) & (region < MAX_DEPTH_NOYOLO)
+
+    ys, xs = np.nonzero(valid)
+    if len(ys) == 0:
+        return None
+
+    # 画像上で最も上(v最小)の行を頭頂の行とみなす
+    top_row = ys.min()
+    row_xs = xs[ys == top_row]
+    # その行内で有効なピクセルの中心を頭頂のx座標とする
+    top_col = int(np.mean(row_xs))
+    u, v = top_col, int(top_row)
+    # 深度値はその行で実際に有効だったピクセルから取る(中心座標そのものが
+    # 有効とは限らないため、row_xs[0] の実測値を使う)
+    depth_mm = float(region[top_row, row_xs[0]])
+
+    world = pixel_to_world(u, v, depth_mm, fx, fy, cx, cy)
+    if world is None:
+        return None
+
+    return HeadVertexResult(
+        world=world, uv=(u, v),
+        box_region=(0, 0, region.shape[1], region.shape[0])
+    )
+
 
 # ---------------------------------------------------------------------------
 # マルチスレッド用の共有リソース
@@ -215,10 +146,6 @@ _main_timings = {
     "push": deque(maxlen=120),
     "total": deque(maxlen=120),
 }
-_worker_timings = {
-    "inference": deque(maxlen=120),
-    "postprocess": deque(maxlen=120),
-}
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +154,7 @@ _worker_timings = {
 
 def push_frame_for_inference(color_image, depth_raw, depth_scale):
     """
-    推論スレッドへフレームを渡す。キューが満杯（＝推論が追いついていない）場合は
+    推論スレッドへフレームを渡す。キューが満杯（＝処理が追いついていない）場合は
     古いフレームを捨てて最新のものに差し替える。メインループは絶対にブロックされない。
     """
     if frame_queue.full():
@@ -245,19 +172,6 @@ def euclidean_distance(p1, p2):
     """2つの3D座標(cm)間のユークリッド距離(cm)を計算"""
     return math.sqrt(sum((a - b) ** 2 for a, b in zip(p1, p2)))
 
-
-def pixel_to_world(u, v, depth_mm, fx, fy, cx, cy):
-    """
-    u, v      : ピクセル座標（反転していない元画像上）
-    depth_mm  : そのピクセルの深度値（mm）
-    戻り値    : (X, Y, Z) cm 単位（depth_mm / 10.0 で mm→cm 変換）
-    """
-    Z = depth_mm / 10.0  # mm → cm
-    if Z <= 0:
-        return None
-    X = (u - cx) * Z / fx
-    Y = (v - cy) * Z / fy
-    return X, Y, Z
 
 def get_hw_stream_config(pipeline: Pipeline):
     config = Config()
@@ -281,8 +195,6 @@ def get_hw_stream_config(pipeline: Pipeline):
                 _intrinsics["fy"] = intrinsic.fy
                 _intrinsics["cx"] = intrinsic.cx
                 _intrinsics["cy"] = intrinsic.cy
-                # print(f"[HW] fx={intrinsic.fx}, fy={intrinsic.fy}, "
-                #       f"cx={intrinsic.cx}, cy={intrinsic.cy}")
             except Exception as e:
                 print(f"[HW] 内部パラメータ取得失敗: {e}")
 
@@ -310,19 +222,17 @@ def _log_timings():
         f"align={avg(_main_timings['align']):.1f} "
         f"color={avg(_main_timings['color']):.1f} "
         f"depth_copy={avg(_main_timings['depth_copy']):.1f} "
-        f"push={avg(_main_timings['push']):.1f}) "
-        f"worker(inference={avg(_worker_timings['inference']):.1f} "
-        f"postprocess={avg(_worker_timings['postprocess']):.1f})"
+        f"push={avg(_main_timings['push']):.1f})"
     )
 
 
 # ---------------------------------------------------------------------------
-# 推論スレッド本体（YOLO推論 + 座標計算 + TCP送信）
+# 推論スレッド本体（深度のみで頭部推定 + TCP送信）
 # ---------------------------------------------------------------------------
 
-def yolo_worker(use_tcp: bool):
+def Un_yolo_worker(use_tcp: bool):
     """
-    frame_queue から最新フレームを取り出し、YOLO推論・目の3D座標算出・TCP送信を行う。
+    frame_queue から最新フレームを取り出し、深度のみで頭頂点・目の3D座標算出・TCP送信を行う。
     """
     global client
     report_ts = time.perf_counter()
@@ -340,42 +250,7 @@ def yolo_worker(use_tcp: bool):
         if fx is None:
             continue
 
-        t0 = time.perf_counter()
-        try:
-            results = YoloModel(color_image, imgsz=320,
-                                device=YOLO_DEVICE or None, verbose=False)
-            results = results[0]
-        except Exception as e:
-            print(f"YOLO推論エラー: {e}")
-            continue
-
-        t_inf = time.perf_counter()
-        _worker_timings["inference"].append(t_inf - t0)
-
-        if results.keypoints is None or results.boxes is None:
-            continue
-        kpts = results.keypoints.xy
-        kpts = kpts.cpu().numpy() if hasattr(kpts, "cpu") else np.asarray(kpts)
-        boxes = results.boxes.xyxy
-        boxes = boxes.cpu().numpy() if hasattr(boxes, "cpu") else np.asarray(boxes)
-        if len(kpts) == 0 or len(boxes) == 0:
-            continue
-
-        nose = kpts[0][0]
-        box = boxes[0]
-
-        fx = _intrinsics["fx"]; fy = _intrinsics["fy"]
-        cx = _intrinsics["cx"]; cy = _intrinsics["cy"]
-        if fx is None:
-            continue
-
-        # head_world = estimate_head_vertex(depth_raw, depth_scale, box, nose, fx, fy, cx, cy)
-        # if head_world is None:
-        #     continue
-
-        # left_world, right_world = fixed_eye_world_positions_no_yaw(head_world)
-
-        result = estimate_head_vertex(depth_raw, depth_scale, box, nose, fx, fy, cx, cy)
+        result = estimate_head_vertex_NoYolo(depth_raw, depth_scale, fx, fy, cx, cy)
         if result is None:
             continue
         head_world, head_uv, (rx1, ry1, rx2, r_head_bottom) = result
@@ -384,7 +259,7 @@ def yolo_worker(use_tcp: bool):
         # 描画フレーム（TCP でなければ表示用に生成）
         if use_tcp is False:
             annotated = color_image.copy()
-            # 頭部候補領域(マスクをかけた矩形)
+            # 探索対象領域(全画面)
             cv2.rectangle(annotated, (rx1, ry1), (rx2, r_head_bottom), (0, 200, 0), 1)
 
             # 頭頂点
@@ -412,15 +287,12 @@ def yolo_worker(use_tcp: bool):
         XL, YL, ZL = left_world
         XR, YR, ZR = right_world
         message = f"{XL:.3f},{YL:.3f},{ZL:.3f},{XR:.3f},{YR:.3f},{ZR:.3f}\n"
-        # print(message)
         if use_tcp and client is not None:
             try:
                 with tcp_lock:
                     client.sendall(message.encode())
             except OSError as e:
                 print(f"TCP送信エラー: {e}")
-
-        _worker_timings["postprocess"].append(time.perf_counter() - t_inf)
 
         # 2秒おきにタイミングログ
         now = time.perf_counter()
@@ -440,10 +312,9 @@ def main():
         print("Device Not Found! Please connect an Orbbec camera and try again.")
         return
 
-    parser = argparse.ArgumentParser(description="Color + Depth aligned viewer (multithreaded)")
+    parser = argparse.ArgumentParser(description="Color + Depth aligned viewer (multithreaded, no YOLO)")
     parser.add_argument("--hw", action="store_true", help="Use hardware D2C alignment")
     parser.add_argument("--no-tcp", action="store_true", help="Do not connect to the TCP server")
-    parser.add_argument("--coreml", action="store_true", help="Force CoreML model (overrides USE_COREML)")
     args = parser.parse_args()
 
     use_tcp = not args.no_tcp
@@ -464,7 +335,7 @@ def main():
     else:
         print("TCPなしモードで起動します（送信は行いません）")
 
-    window_name = "YoloKeypoints"
+    window_name = "HeadTracking"
     if show_window:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, 1280, 720)
@@ -537,9 +408,9 @@ def main():
         return
 
     # ------------------------------------------------------------------
-    # 推論スレッド開始（YOLO推論 + TCP送信はここで非同期に走る）
+    # 推論スレッド開始（深度のみでの頭部推定 + TCP送信はここで非同期に走る）
     # ------------------------------------------------------------------
-    inference_thread = threading.Thread(target=yolo_worker, args=(use_tcp,), daemon=True)
+    inference_thread = threading.Thread(target=Un_yolo_worker, args=(use_tcp,), daemon=True)
     inference_thread.start()
 
     report_ts = time.perf_counter()
@@ -577,7 +448,7 @@ def main():
                 if color_image is None:
                     continue
 
-                # 深度：uint16 コピーだけ取得（スケール適用・クリップは推論スレッドで2ピクセルのみ）
+                # 深度：uint16 コピーだけ取得（スケール適用は推論スレッド側で行う）
                 t_depth = time.perf_counter()
                 try:
                     depth_raw = np.frombuffer(depth_frame.get_data(), dtype=np.uint16).reshape(
@@ -604,7 +475,7 @@ def main():
                 push_frame_for_inference(color_image, depth_raw, depth_scale)
                 _main_timings["push"].append(time.perf_counter() - t_push)
 
-                # YOLOランドマーク表示（推論スレッドから受け取り）
+                # 推定結果の表示（推論スレッドから受け取り）
                 if show_window:
                     try:
                         annotated_frame = display_queue.get_nowait()
