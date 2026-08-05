@@ -73,6 +73,9 @@ USE_COREML = False
 HOST = "127.0.0.1"
 PORT = 50000
 
+#頭部マスキング閾値
+HEAD_REGION_RATIO = 0.35
+DEPTH_TOLERANCE_MM = 250.0 
 
 client = None  # main() 内で必要な場合のみ接続する
 
@@ -80,7 +83,7 @@ client = None  # main() 内で必要な場合のみ接続する
 HEAD_TOP_TO_EYE_DROP_CM = 12.0   # 頭頂から目までの推定オフセット(決め打ち)
 HALF_IPD_CM = 3.2                # 目の左右間隔の半分(決め打ち)
 
-//
+
 def estimate_head_top_pixel(nose, l_ear, r_ear, box_top_y):
     xs = [p[0] for p in (nose, l_ear, r_ear) if p is not None]
     cx_head = sum(xs) / len(xs) if xs else nose[0]
@@ -104,7 +107,67 @@ def fixed_eye_world_positions(head_world, yaw_ratio):
     right = (Xh + HALF_IPD_CM, Yh + HEAD_TOP_TO_EYE_DROP_CM, Zh - shift)
     return left, right
 
+from collections import namedtuple
 
+HeadVertexResult = namedtuple(
+    "HeadVertexResult", ["world", "uv", "box_region"]
+)
+
+#深度から頭の位置を推定する関数
+def estimate_head_vertex(depth_raw, depth_scale, box, nose_uv, fx, fy, cx, cy):
+    h, w = depth_raw.shape[:2]
+    x1 = max(int(box[0]), 0)
+    y1 = max(int(box[1]), 0)
+    x2 = min(int(box[2]), w - 1)
+    y2 = min(int(box[3]), h - 1)
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    head_bottom = y1 + max(int((y2 - y1) * HEAD_REGION_RATIO), 1)
+
+    nx, ny = int(nose_uv[0]), int(nose_uv[1])
+    if not (0 <= ny < h and 0 <= nx < w):
+        return None
+    ref_depth = float(depth_raw[ny, nx]) * depth_scale
+    if not (MIN_DEPTH < ref_depth < MAX_DEPTH):
+        return None
+
+    region = depth_raw[y1:head_bottom, x1:x2].astype(np.float32) * depth_scale
+    valid = (
+        (region > MIN_DEPTH) & (region < MAX_DEPTH) &
+        (np.abs(region - ref_depth) < DEPTH_TOLERANCE_MM)
+    )
+
+    ys, xs = np.nonzero(valid)
+    if len(ys) == 0:
+        return None
+
+    top_row = ys.min()
+    row_xs = xs[ys == top_row]
+    top_col = int(np.mean(row_xs))
+    u = x1 + top_col
+    v = y1 + top_row
+    depth_mm = float(region[top_row, row_xs[0]])
+
+    world = pixel_to_world(u, v, depth_mm, fx, fy, cx, cy)
+    if world is None:
+        return None
+
+    return HeadVertexResult(world=world, uv=(u, v), box_region=(x1, y1, x2, head_bottom))
+
+def fixed_eye_world_positions_no_yaw(head_world):
+    """向きを無視して、頭頂点からの定数オフセットだけで目の位置を出す"""
+    Xh, Yh, Zh = head_world
+    left = (Xh - HALF_IPD_CM, Yh + HEAD_TOP_TO_EYE_DROP_CM, Zh)
+    right = (Xh + HALF_IPD_CM, Yh + HEAD_TOP_TO_EYE_DROP_CM, Zh)
+    return left, right
+#3D座標をピクセル座標に変換する関数
+def world_to_pixel(X, Y, Z, fx, fy, cx, cy):
+    if Z <= 0:
+        return None
+    u = fx * X / Z + cx
+    v = fy * Y / Z + cy
+    return int(u), int(v)
 # ---------------------------------------------------------------------------
 # デバイス選択
 # ---------------------------------------------------------------------------
@@ -195,7 +258,6 @@ def pixel_to_world(u, v, depth_mm, fx, fy, cx, cy):
     X = (u - cx) * Z / fx
     Y = (v - cy) * Z / fy
     return X, Y, Z
-
 
 def get_hw_stream_config(pipeline: Pipeline):
     config = Config()
@@ -290,41 +352,53 @@ def yolo_worker(use_tcp: bool):
         t_inf = time.perf_counter()
         _worker_timings["inference"].append(t_inf - t0)
 
-        if results.keypoints is None:
+        if results.keypoints is None or results.boxes is None:
             continue
         kpts = results.keypoints.xy
-        # CoreML/MPS では既に CPU 上のことが多いが、念のため .cpu() を挟む
         kpts = kpts.cpu().numpy() if hasattr(kpts, "cpu") else np.asarray(kpts)
-        if len(kpts) == 0:
+        boxes = results.boxes.xyxy
+        boxes = boxes.cpu().numpy() if hasattr(boxes, "cpu") else np.asarray(boxes)
+        if len(kpts) == 0 or len(boxes) == 0:
             continue
+
         nose = kpts[0][0]
-        l_ear = kpts[0][3]
-        r_ear = kpts[0][4]
-        left_eye = kpts[0][1]
-        right_eye = kpts[0][2]
+        box = boxes[0]
 
-        lx, ly = int(left_eye[0]), int(left_eye[1])
-        rx, ry = int(right_eye[0]), int(right_eye[1])
-
-        h, w = depth_raw.shape[:2]
-        if not (0 <= ly < h and 0 <= lx < w and 0 <= ry < h and 0 <= rx < w):
+        fx = _intrinsics["fx"]; fy = _intrinsics["fy"]
+        cx = _intrinsics["cx"]; cy = _intrinsics["cy"]
+        if fx is None:
             continue
 
-        # 深度は「目の2ピクセルだけ」取得・スケール適用・クリップ
-        left_depth = float(depth_raw[ly, lx]) * depth_scale
-        right_depth = float(depth_raw[ry, rx]) * depth_scale
-        if not (MIN_DEPTH < left_depth < MAX_DEPTH
-                and MIN_DEPTH < right_depth < MAX_DEPTH):
-            continue
+        # head_world = estimate_head_vertex(depth_raw, depth_scale, box, nose, fx, fy, cx, cy)
+        # if head_world is None:
+        #     continue
 
-        left_world = pixel_to_world(lx, ly, left_depth, fx, fy, cx, cy)
-        right_world = pixel_to_world(rx, ry, right_depth, fx, fy, cx, cy)
-        if left_world is None or right_world is None:
+        # left_world, right_world = fixed_eye_world_positions_no_yaw(head_world)
+
+        result = estimate_head_vertex(depth_raw, depth_scale, box, nose, fx, fy, cx, cy)
+        if result is None:
             continue
+        head_world, head_uv, (rx1, ry1, rx2, r_head_bottom) = result
+        left_world, right_world = fixed_eye_world_positions_no_yaw(head_world)
 
         # 描画フレーム（TCP でなければ表示用に生成）
         if use_tcp is False:
-            annotated = results.plot()
+            annotated = color_image.copy()
+            # 頭部候補領域(マスクをかけた矩形)
+            cv2.rectangle(annotated, (rx1, ry1), (rx2, r_head_bottom), (0, 200, 0), 1)
+
+            # 頭頂点
+            cv2.circle(annotated, head_uv, 6, (0, 255, 255), -1)
+            cv2.putText(annotated, f"Z={head_world[2]:.1f}cm", (head_uv[0] + 8, head_uv[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+            # 推定した目の位置(3D→2D逆投影)
+            for label, w_pos in (("L", left_world), ("R", right_world)):
+                px = world_to_pixel(*w_pos, fx, fy, cx, cy)
+                if px is not None:
+                    cv2.circle(annotated, px, 5, (255, 0, 255), -1)
+                    cv2.putText(annotated, label, (px[0] + 6, px[1]),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
             if display_queue.full():
                 try:
                     display_queue.get_nowait()
